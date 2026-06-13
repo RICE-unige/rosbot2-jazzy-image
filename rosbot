@@ -1,0 +1,1761 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${ROSBOT_ENV_FILE:-$SCRIPT_DIR/rosbot.env}"
+RUN_DIR="${ROSBOT_RUN_DIR:-$HOME/.rosbot}"
+LOG_DIR="${ROSBOT_LOG_DIR:-$RUN_DIR/logs}"
+TWIST_BRIDGE_SCRIPT="$SCRIPT_DIR/rosbot_twist_bridge.py"
+LIDAR_HOLD_SCRIPT="$SCRIPT_DIR/rosbot_lidar_motor_hold.py"
+BATTERY_MONITOR_SCRIPT="$SCRIPT_DIR/rosbot_battery_monitor.py"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  RESET=$'\033[0m'
+  BOLD=$'\033[1m'
+  DIM=$'\033[2m'
+  GREEN=$'\033[38;5;48m'
+  YELLOW=$'\033[38;5;214m'
+  RED=$'\033[38;5;203m'
+  BLUE=$'\033[38;5;39m'
+  CYAN=$'\033[38;5;51m'
+  MUTED=$'\033[38;5;244m'
+else
+  RESET=""
+  BOLD=""
+  DIM=""
+  GREEN=""
+  YELLOW=""
+  RED=""
+  BLUE=""
+  CYAN=""
+  MUTED=""
+fi
+
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+namespace="${ROSBOT_NAMESPACE:-}"
+camera="${ROSBOT_START_CAMERA:-false}"
+lidar="${ROSBOT_START_LIDAR:-true}"
+joy="${ROSBOT_START_JOY:-false}"
+verbose="${ROSBOT_VERBOSE:-false}"
+monitor_interval="${ROSBOT_MONITOR_INTERVAL:-2}"
+twist_bridge="${ROSBOT_TWIST_BRIDGE:-true}"
+lidar_port="${ROSBOT_LIDAR_PORT:-/dev/rplidar}"
+battery_safety="${ROSBOT_BATTERY_SAFETY:-true}"
+battery_topic="${ROSBOT_BATTERY_TOPIC:-battery}"
+battery_warn_percent="${ROSBOT_BATTERY_WARN_PERCENT:-20}"
+battery_stop_percent="${ROSBOT_BATTERY_STOP_PERCENT:-10}"
+battery_stop_delay="${ROSBOT_BATTERY_STOP_DELAY:-60}"
+battery_stop_timeout="${ROSBOT_BATTERY_STOP_TIMEOUT:-20}"
+battery_trend_window="${ROSBOT_BATTERY_TREND_WINDOW:-120}"
+battery_trend_min_dv="${ROSBOT_BATTERY_TREND_MIN_DV:-0.03}"
+dry_run=false
+yes=false
+monitor_once=false
+
+banner() {
+  printf '\n%bROSbot 2.0%b  %bROS 2 Jazzy control%b\n' "$BOLD$CYAN" "$RESET" "$MUTED" "$RESET"
+  printf '%bASUS Tinker Board | Ubuntu 24.04 | Nav2 + SLAM Toolbox%b\n\n' "$MUTED" "$RESET"
+}
+
+section() {
+  printf '\n%b%s%b\n' "$BOLD$BLUE" "$1" "$RESET"
+}
+
+field() {
+  printf '  %-13s %b\n' "$1" "$2"
+}
+
+ok() {
+  printf '%bOK%b      %s\n' "$GREEN" "$RESET" "$*"
+}
+
+info() {
+  printf '%bInfo%b    %s\n' "$BLUE" "$RESET" "$*"
+}
+
+warn() {
+  printf '%bWarning%b %s\n' "$YELLOW" "$RESET" "$*"
+}
+
+error() {
+  printf '%bError%b   %s\n' "$RED" "$RESET" "$*" >&2
+}
+
+usage() {
+  banner
+  printf '%bUsage%b\n' "$BOLD" "$RESET"
+  printf '  ./rosbot %b<command>%b %b[options]%b\n\n' "$GREEN" "$RESET" "$CYAN" "$RESET"
+
+  printf '%bRobot runtime%b\n' "$BOLD" "$RESET"
+  printf '  %-24s %s\n' "base | start" "Start base driver stack"
+  printf '  %-24s %s\n' "slam" "Start mapping mode"
+  printf '  %-24s %s\n' "nav" "Start live SLAM plus Nav2"
+  printf '  %-24s %s\n' "map MAP.yaml" "Start saved-map localization plus Nav2"
+  printf '  %-24s %s\n' "restart [MODE]" "Stop current stack, then start MODE"
+  printf '  %-24s %s\n' "stop" "Stop stack, lidar, bridge, and monitor"
+  printf '\n'
+
+  printf '%bOperations%b\n' "$BOLD" "$RESET"
+  printf '  %-24s %s\n' "status" "Show compact robot status"
+  printf '  %-24s %s\n' "monitor" "Live status dashboard"
+  printf '  %-24s %s\n' "teleop" "Run keyboard teleop with normal Twist commands"
+  printf '  %-24s %s\n' "logs [FILE]" "Follow the latest ROSbot log, or a specific log"
+  printf '  %-24s %s\n' "save-map [MAP_BASE]" "Save the current map"
+  printf '  %-24s %s\n' "pose X Y YAW" "Publish initial pose for saved-map navigation"
+  printf '  %-24s %s\n' "goal X Y YAW --yes" "Send one supervised Nav2 goal in radians"
+  printf '\n'
+
+  printf '%bOptions%b\n' "$BOLD" "$RESET"
+  printf '  %-24s %s\n' "--namespace NAME" "Use ROS namespace, e.g. robot1"
+  printf '  %-24s %s\n' "--camera / --no-camera" "Enable or disable camera"
+  printf '  %-24s %s\n' "--lidar / --no-lidar" "Enable lidar where supported"
+  printf '  %-24s %s\n' "--joy / --no-joy" "Enable or disable joystick teleop"
+  printf '  %-24s %s\n' "--verbose" "Run in foreground and stream launch output"
+  printf '  %-24s %s\n' "--dry-run" "Print the command without running it"
+  printf '  %-24s %s\n' "--battery-safety" "Enable low-battery auto-stop"
+  printf '  %-24s %s\n' "--no-battery-safety" "Disable low-battery auto-stop"
+  printf '  %-24s %s\n' "--battery-topic TOPIC" "BatteryState topic"
+  printf '  %-24s %s\n' "--battery-warn-percent N" "Low battery warning threshold"
+  printf '  %-24s %s\n' "--battery-stop-percent N" "Auto-stop threshold"
+  printf '  %-24s %s\n' "--battery-stop-delay SEC" "Seconds below threshold before stop"
+  printf '  %-24s %s\n' "--battery-stop-timeout SEC" "Stop command timeout before hard fallback"
+  printf '  %-24s %s\n' "--battery-trend-window SEC" "Window used to infer charging state"
+  printf '  %-24s %s\n' "--battery-trend-min-dv V" "Voltage delta needed for trend"
+  printf '  %-24s %s\n' "--once" "Run one monitor refresh and exit"
+  printf '  %-24s %s\n' "--interval SEC" "Monitor refresh interval"
+  printf '  %-24s %s\n' "--yes" "Required for commands that can move the robot"
+  printf '\n'
+
+  printf '%bExamples%b\n' "$BOLD" "$RESET"
+  printf '  %-34s %s\n' "./rosbot base --camera" "base stack with camera"
+  printf '  %-34s %s\n' "./rosbot restart nav --camera" "switch from base to navigation"
+  printf '  %-34s %s\n' "./rosbot restart map ~/maps/room.yaml" "saved-map navigation"
+  printf '  %-34s %s\n' "./rosbot teleop" "keyboard driving"
+  printf '  %-34s %s\n' "./rosbot monitor" "live robot dashboard"
+  printf '\n'
+
+  printf '%bConfiguration%b\n' "$BOLD" "$RESET"
+  printf '  Copy %brosbot.env.example%b to %brosbot.env%b and edit persistent defaults.\n\n' "$CYAN" "$RESET" "$CYAN" "$RESET"
+}
+
+is_true() {
+  case "${1,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+bool_launch() {
+  case "${1,,}" in
+    1|true|yes|on) echo "True" ;;
+    0|false|no|off|"") echo "False" ;;
+    *)
+      error "Invalid boolean value: $1"
+      exit 2
+      ;;
+  esac
+}
+
+bool_word() {
+  if is_true "$1"; then
+    printf '%bon%b' "$GREEN" "$RESET"
+  else
+    printf '%boff%b' "$MUTED" "$RESET"
+  fi
+}
+
+temp_word() {
+  local raw="$1"
+  local num="${raw%% *}"
+  if [ -z "$raw" ] || ! [[ "$num" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf 'unknown'
+  elif awk "BEGIN { exit !($num >= 75) }"; then
+    printf '%b%s%b' "$RED" "$raw" "$RESET"
+  elif awk "BEGIN { exit !($num >= 70) }"; then
+    printf '%b%s%b' "$YELLOW" "$raw" "$RESET"
+  else
+    printf '%b%s%b' "$GREEN" "$raw" "$RESET"
+  fi
+}
+
+percent_word() {
+  local raw="$1"
+  local num="${raw%% *}"
+  if [ -z "$raw" ] || ! [[ "$num" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf 'unknown'
+  elif awk "BEGIN { exit !($num <= ${battery_stop_percent:-10}) }"; then
+    printf '%b%s%%%b' "$RED" "$num" "$RESET"
+  elif awk "BEGIN { exit !($num <= ${battery_warn_percent:-20}) }"; then
+    printf '%b%s%%%b' "$YELLOW" "$num" "$RESET"
+  else
+    printf '%b%s%%%b' "$GREEN" "$num" "$RESET"
+  fi
+}
+
+alert_word() {
+  case "$1" in
+    critical)
+      printf '%bcritical%b' "$RED" "$RESET"
+      ;;
+    low)
+      printf '%blow%b' "$YELLOW" "$RESET"
+      ;;
+    ok)
+      printf '%bok%b' "$GREEN" "$RESET"
+      ;;
+    *)
+      printf '%bunknown%b' "$MUTED" "$RESET"
+      ;;
+  esac
+}
+
+battery_trend_word() {
+  local value="${1:-unknown}"
+  local label="${value//_/ }"
+  case "$value" in
+    charging|full|probably_charging)
+      printf '%b%s%b' "$GREEN" "$label" "$RESET"
+      ;;
+    discharging|probably_discharging|not_charging)
+      printf '%b%s%b' "$YELLOW" "$label" "$RESET"
+      ;;
+    stable)
+      printf '%bstable%b' "$MUTED" "$RESET"
+      ;;
+    *)
+      printf '%bunknown%b' "$MUTED" "$RESET"
+      ;;
+  esac
+}
+
+battery_trend_display() {
+  local trend="${1:-unknown}"
+  local source="${2:-}"
+  local window="${3:-}"
+  local delta_voltage="${4:-}"
+  local delta_percent="${5:-}"
+  local text detail source_text
+
+  text="$(battery_trend_word "$trend")"
+  if [ -n "$delta_voltage" ] && [ -n "$window" ]; then
+    detail="${delta_voltage} V/${window}s"
+    if [ -n "$delta_percent" ]; then
+      detail="${detail}, ${delta_percent}%"
+    fi
+    text="${text} (${detail})"
+  fi
+
+  case "$source" in
+    firmware)
+      source_text="firmware"
+      ;;
+    voltage_trend)
+      source_text="inferred"
+      ;;
+    *)
+      source_text=""
+      ;;
+  esac
+  if [ -n "$source_text" ]; then
+    text="${text} ${MUTED}${source_text}${RESET}"
+  fi
+  printf '%b' "$text"
+}
+
+normalize_namespace() {
+  local value="$1"
+  value="${value#/}"
+  value="${value%/}"
+  printf '%s' "$value"
+}
+
+display_namespace() {
+  if [ -n "$1" ]; then
+    printf '/%s' "$1"
+  else
+    printf '/'
+  fi
+}
+
+battery_topic_name() {
+  local topic="$battery_topic"
+  if [[ "$topic" == /* ]]; then
+    printf '%s' "$topic"
+  elif [ -n "$namespace" ]; then
+    printf '/%s/%s' "$namespace" "$topic"
+  else
+    printf '/%s' "$topic"
+  fi
+}
+
+sanitize_name() {
+  local value="$1"
+  value="${value//[^A-Za-z0-9_.-]/_}"
+  value="${value##_}"
+  value="${value%%_}"
+  printf '%s' "${value:-default}"
+}
+
+quote_cmd() {
+  local arg
+  for arg in "$@"; do
+    printf '%q ' "$arg"
+  done
+  printf '\n'
+}
+
+env_file_status() {
+  if [ -f "$ENV_FILE" ]; then
+    printf '%s' "$ENV_FILE"
+  else
+    printf '%s %b(missing, using defaults)%b' "$ENV_FILE" "$MUTED" "$RESET"
+  fi
+}
+
+latest_log() {
+  find "$LOG_DIR" -maxdepth 1 -type f -name '*.log' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -n \
+    | tail -n 1 \
+    | cut -d' ' -f2-
+}
+
+battery_cache_file() {
+  printf '%s/battery.env' "$RUN_DIR"
+}
+
+battery_history_file() {
+  printf '%s/battery-history.tsv' "$RUN_DIR"
+}
+
+battery_cache_raw() {
+  local cache
+  cache="$(battery_cache_file)"
+  if [ -f "$cache" ]; then
+    cat "$cache"
+    return 0
+  fi
+
+  [ -f "$BATTERY_MONITOR_SCRIPT" ] || return 1
+  [ -f "$HOME/ros2_setup.sh" ] || return 1
+  bash -lc 'source "$HOME/ros2_setup.sh" && exec python3 "$1" once --topic "$2" --cache "$3" --history "$4" --trend-window "$5" --trend-min-dv "$6" --timeout 3.0' \
+    _ "$BATTERY_MONITOR_SCRIPT" "$(battery_topic_name)" "$cache" "$(battery_history_file)" "$battery_trend_window" "$battery_trend_min_dv" 2>/dev/null || true
+}
+
+battery_value() {
+  local raw="$1"
+  local key="$2"
+  printf '%s\n' "$raw" | awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); gsub(/^'\''|'\''$/, ""); print; exit }'
+}
+
+battery_monitor_pid() {
+  local pid_file="$RUN_DIR/battery-monitor.pid"
+  local pid=""
+  if [ -f "$pid_file" ]; then
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  pgrep -f "[r]osbot_battery_monitor.py watch" 2>/dev/null | head -n 1 || true
+}
+
+battery_monitor_status() {
+  local pid cache raw_cache raw_stop raw_delay raw_safety monitor_args
+  pid="$(battery_monitor_pid)"
+  cache="$(battery_cache_file)"
+  if [ -f "$cache" ]; then
+    raw_cache="$(cat "$cache" 2>/dev/null || true)"
+    raw_stop="$(battery_value "$raw_cache" stop_percent)"
+    raw_delay="$(battery_value "$raw_cache" stop_delay)"
+    raw_safety="$(battery_value "$raw_cache" safety)"
+  fi
+  [ -n "${raw_stop:-}" ] || raw_stop="$battery_stop_percent"
+  [ -n "${raw_delay:-}" ] || raw_delay="$battery_stop_delay"
+  if [ -n "$pid" ]; then
+    monitor_args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if printf '%s\n' "$monitor_args" | grep -q -- '--safety'; then
+      raw_safety="on"
+    elif [ -z "${raw_safety:-}" ]; then
+      raw_safety="off"
+    fi
+  fi
+  [ -n "${raw_safety:-}" ] || raw_safety="$battery_safety"
+  if [ -n "$pid" ]; then
+    if is_true "$raw_safety"; then
+      printf '%bon%b (PID %s, stop <= %s%% for %ss)' "$GREEN" "$RESET" "$pid" "$raw_stop" "$raw_delay"
+    else
+      printf '%boff%b (monitor PID %s)' "$YELLOW" "$RESET" "$pid"
+    fi
+  elif is_true "$raw_safety"; then
+    printf '%bnot running%b' "$YELLOW" "$RESET"
+  else
+    printf '%boff%b' "$MUTED" "$RESET"
+  fi
+}
+
+mark_battery_safety_stopped() {
+  local cache tmp
+  cache="$(battery_cache_file)"
+  [ -f "$cache" ] || return 0
+  tmp="${cache}.tmp.$$"
+  awk '
+    BEGIN { saw_safety=0; saw_alert=0; saw_timer=0 }
+    /^safety=/ { print "safety=off"; saw_safety=1; next }
+    /^alert=/ { print "alert=ok"; saw_alert=1; next }
+    /^timer_remaining=/ { print "timer_remaining="; saw_timer=1; next }
+    { print }
+    END {
+      if (!saw_safety) print "safety=off"
+      if (!saw_alert) print "alert=ok"
+      if (!saw_timer) print "timer_remaining="
+    }
+  ' "$cache" > "$tmp" && mv "$tmp" "$cache"
+}
+
+start_battery_monitor() {
+  [ -f "$BATTERY_MONITOR_SCRIPT" ] || {
+    warn "Battery monitor script is missing: $BATTERY_MONITOR_SCRIPT"
+    return 0
+  }
+  [ -f "$HOME/ros2_setup.sh" ] || return 0
+
+  stop_battery_monitor
+  rm -f "$(battery_cache_file)"
+
+  mkdir -p "$LOG_DIR"
+  local pid_file log pid topic cache history
+  local -a monitor_cmd=()
+  pid_file="$RUN_DIR/battery-monitor.pid"
+  log="$LOG_DIR/battery-monitor-$(sanitize_name "${namespace:-base}")-$(date '+%Y%m%d-%H%M%S').log"
+  topic="$(battery_topic_name)"
+  cache="$(battery_cache_file)"
+  history="$(battery_history_file)"
+
+  monitor_cmd=(
+    python3 "$BATTERY_MONITOR_SCRIPT" watch
+    --topic "$topic"
+    --cache "$cache"
+    --history "$history"
+    --warn-percent "$battery_warn_percent"
+    --stop-percent "$battery_stop_percent"
+    --stop-delay "$battery_stop_delay"
+    --trend-window "$battery_trend_window"
+    --trend-min-dv "$battery_trend_min_dv"
+    --namespace "$namespace"
+  )
+  if is_true "$battery_safety"; then
+    monitor_cmd+=(--safety)
+  fi
+  monitor_cmd+=(
+    --stop-command "$SCRIPT_DIR/rosbot stop --no-battery-safety"
+    --stop-timeout "$battery_stop_timeout"
+    --lidar-hold-command "python3 $LIDAR_HOLD_SCRIPT --port $lidar_port"
+  )
+
+  nohup bash -lc 'source "$HOME/ros2_setup.sh" && exec "$@"' _ "${monitor_cmd[@]}" >"$log" 2>&1 < /dev/null &
+  pid="$!"
+  echo "$pid" > "$pid_file"
+  sleep 0.4
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    rm -f "$pid_file"
+    warn "Battery monitor failed to start. See $log"
+  fi
+}
+
+stop_battery_monitor() {
+  local pid
+  pid="$(battery_monitor_pid)"
+  if [ -n "$pid" ] && ! is_protected_pid "$pid"; then
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+    sleep 0.5
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill -KILL "$pid" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f "$RUN_DIR/battery-monitor.pid"
+  mark_battery_safety_stopped
+}
+
+process_rows() {
+  ps -eo pid=,comm=,args= \
+    | awk '
+      /ros2 launch rosbot_bringup|rplidar_composition|openni2_camera_driver|ros2_control_node|robot_state_publisher|ekf_node|slam_toolbox|map_server|amcl|planner_server|controller_server|smoother_server|behavior_server|bt_navigator|waypoint_follower|velocity_smoother|collision_monitor|lifecycle_manager|tf_namespace_bridge|bridge_node|image_transport\/republish|rosbot_twist_bridge.py|rosbot_battery_monitor.py/ &&
+      $2 !~ /^(awk|bash|dash|sh|grep|pgrep|script|timeout)$/ {
+        print
+      }'
+}
+
+twist_bridge_pid() {
+  local pid_file="$RUN_DIR/twist-bridge.pid"
+  local pid=""
+  if [ -f "$pid_file" ]; then
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  pgrep -f "[r]osbot_twist_bridge.py.*--namespace ${namespace}" 2>/dev/null | head -n 1 || true
+}
+
+twist_bridge_status() {
+  local pid
+  pid="$(twist_bridge_pid)"
+  if [ -n "$pid" ]; then
+    printf '%brunning%b (PID %s)' "$GREEN" "$RESET" "$pid"
+  elif is_true "$twist_bridge"; then
+    printf '%bnot running%b' "$YELLOW" "$RESET"
+  else
+    printf '%bdisabled%b' "$MUTED" "$RESET"
+  fi
+}
+
+start_twist_bridge() {
+  is_true "$twist_bridge" || return 0
+  [ -f "$TWIST_BRIDGE_SCRIPT" ] || {
+    warn "Twist compatibility bridge script is missing: $TWIST_BRIDGE_SCRIPT"
+    return 0
+  }
+
+  local existing pid_file log pid bridge_namespace bridge_frame bridge_in bridge_out
+  existing="$(twist_bridge_pid)"
+  if [ -n "$existing" ]; then
+    return 0
+  fi
+
+  mkdir -p "$LOG_DIR"
+  pid_file="$RUN_DIR/twist-bridge.pid"
+  log="$LOG_DIR/twist-bridge-$(sanitize_name "${namespace:-base}")-$(date '+%Y%m%d-%H%M%S').log"
+  bridge_namespace="${namespace:-}"
+  bridge_frame="${ROSBOT_BASE_FRAME:-base_link}"
+  bridge_in="${ROSBOT_TWIST_BRIDGE_IN:-cmd_vel}"
+  bridge_out="${ROSBOT_TWIST_BRIDGE_OUT:-cmd_vel_stamped}"
+
+  nohup bash -lc 'source "$HOME/ros2_setup.sh" && exec python3 "$1" --namespace "$2" --frame-id "$3" --in-topic "$4" --out-topic "$5"' \
+    _ "$TWIST_BRIDGE_SCRIPT" "$bridge_namespace" "$bridge_frame" "$bridge_in" "$bridge_out" >"$log" 2>&1 < /dev/null &
+  pid="$!"
+  echo "$pid" > "$pid_file"
+  sleep 0.5
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    warn "Twist compatibility bridge failed to start. See $log"
+  fi
+}
+
+stop_twist_bridge() {
+  local pid
+  pid="$(twist_bridge_pid)"
+  if [ -n "$pid" ]; then
+    kill "$pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$RUN_DIR/twist-bridge.pid"
+}
+
+lidar_hold_pids() {
+  ps -eo pid=,args= \
+    | awk -v port="$lidar_port" '
+      /rosbot_lidar_motor_hold.py/ &&
+      $0 !~ /rosbot_battery_monitor.py/ &&
+      (port == "" || index($0, "--port " port) > 0) {
+        print $1
+      }'
+}
+
+lidar_hold_pid() {
+  local pid_file="$RUN_DIR/lidar-motor-hold.pid"
+  local pid=""
+  if [ -f "$pid_file" ]; then
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1 \
+      && ps -p "$pid" -o args= 2>/dev/null | grep -q 'rosbot_lidar_motor_hold.py' \
+      && ! ps -p "$pid" -o args= 2>/dev/null | grep -q 'rosbot_battery_monitor.py'; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  lidar_hold_pids | head -n 1 || true
+}
+
+lidar_hold_status() {
+  local pid
+  pid="$(lidar_hold_pid)"
+  if [ -n "$pid" ]; then
+    printf '%bheld stopped%b (PID %s)' "$GREEN" "$RESET" "$pid"
+  else
+    printf '%bnot held%b' "$MUTED" "$RESET"
+  fi
+}
+
+start_lidar_motor_hold() {
+  [ -e "$lidar_port" ] || return 0
+  [ -f "$LIDAR_HOLD_SCRIPT" ] || {
+    warn "Lidar motor hold script is missing: $LIDAR_HOLD_SCRIPT"
+    return 0
+  }
+
+  local existing pid_file log pid
+  existing="$(lidar_hold_pid)"
+  if [ -n "$existing" ]; then
+    return 0
+  fi
+
+  mkdir -p "$LOG_DIR"
+  pid_file="$RUN_DIR/lidar-motor-hold.pid"
+  log="$LOG_DIR/lidar-motor-hold-$(date '+%Y%m%d-%H%M%S').log"
+
+  nohup python3 "$LIDAR_HOLD_SCRIPT" --port "$lidar_port" >"$log" 2>&1 < /dev/null &
+  pid="$!"
+  echo "$pid" > "$pid_file"
+  sleep 0.3
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    rm -f "$pid_file"
+    warn "Lidar motor hold failed to start. See $log"
+  fi
+}
+
+stop_lidar_motor_hold() {
+  local pid pids
+  pids="$(lidar_hold_pids || true)"
+  for pid in $pids; do
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+  done
+
+  sleep 0.4
+
+  for pid in $pids; do
+    sleep 0.4
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill -KILL "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+  rm -f "$RUN_DIR/lidar-motor-hold.pid"
+}
+
+ancestor_pids() {
+  local pids ancestor
+  pids=" $$"
+  ancestor="$PPID"
+  while [ -n "$ancestor" ] && [ "$ancestor" != "0" ]; do
+    pids="$pids $ancestor"
+    ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d ' ' || true)"
+  done
+  printf '%s' "$pids"
+}
+
+is_protected_pid() {
+  local candidate="$1"
+  local protected="${2:-$(ancestor_pids)}"
+  case " $protected " in
+    *" $candidate "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+terminate_matching_processes() {
+  local signal="$1"
+  local pattern="$2"
+  local protected pid pids
+  protected="$(ancestor_pids)"
+  pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
+  for pid in $pids; do
+    if ! is_protected_pid "$pid" "$protected"; then
+      kill "-$signal" "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+rosbot_process_rows() {
+  ps -eo pid=,comm=,args= \
+    | awk '
+      /ros2 launch rosbot_bringup|ros2 launch nav2_bringup|ros2 launch slam_toolbox|ros2 launch rplidar_ros|rplidar_composition|openni2_camera_driver|ros2_control_node|robot_state_publisher|ekf_node|slam_toolbox|map_server|amcl|planner_server|controller_server|smoother_server|behavior_server|bt_navigator|waypoint_follower|velocity_smoother|collision_monitor|lifecycle_manager|tf_namespace_bridge|bridge_node|image_transport\/republish|rosbot_twist_bridge.py|rosbot_battery_monitor.py|joy_node|teleop_node/ &&
+      $2 !~ /^(awk|bash|dash|sh|grep|pgrep|script|timeout)$/ {
+        print
+      }'
+}
+
+monitor_pid() {
+  local pid_file="$RUN_DIR/monitor.pid"
+  local pid=""
+  if [ -f "$pid_file" ]; then
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  pgrep -f "[./]rosbot monitor|[/]rosbot2-jazzy-image[/]rosbot monitor" 2>/dev/null | head -n 1 || true
+}
+
+stop_monitor_processes() {
+  local pid pattern
+  pid="$(monitor_pid || true)"
+  if [ -n "$pid" ] && ! is_protected_pid "$pid"; then
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+  fi
+
+  for pattern in "[./]rosbot monitor" "[/]rosbot2-jazzy-image[/]rosbot monitor"; do
+    terminate_matching_processes TERM "$pattern"
+  done
+
+  sleep 0.5
+
+  for pattern in "[./]rosbot monitor" "[/]rosbot2-jazzy-image[/]rosbot monitor"; do
+    terminate_matching_processes KILL "$pattern"
+  done
+
+  rm -f "$RUN_DIR/monitor.pid"
+}
+
+send_zero_velocity() {
+  [ -f "$HOME/ros2_setup.sh" ] || return 0
+
+  set +u
+  # shellcheck disable=SC1090
+  source "$HOME/ros2_setup.sh"
+  set -u
+
+  ROSBOT_CLI_NAMESPACE="$namespace" timeout 3 python3 - <<'PY' 2>/dev/null || true
+import os
+import time
+
+import rclpy
+from geometry_msgs.msg import Twist, TwistStamped
+from std_msgs.msg import Float32MultiArray
+
+
+def namespaced(topic, namespace):
+    if namespace:
+        return f"/{namespace}/{topic}"
+    return f"/{topic}"
+
+
+rclpy.init()
+node = rclpy.create_node("rosbot_cli_stop_zero")
+namespace = os.environ.get("ROSBOT_CLI_NAMESPACE", "").strip("/")
+tf_prefix = os.environ.get("ROBOT_TF_PREFIX", "").strip("/")
+if tf_prefix:
+    tf_prefix = f"{tf_prefix}/"
+
+twist_topics = {namespaced("cmd_vel", namespace), "/cmd_vel"}
+stamped_topics = {namespaced("cmd_vel_stamped", namespace), "/cmd_vel_stamped"}
+motor_topics = {namespaced("_motors/cmd", namespace), "/_motors/cmd"}
+
+twist_publishers = [node.create_publisher(Twist, topic, 10) for topic in sorted(twist_topics)]
+stamped_publishers = [node.create_publisher(TwistStamped, topic, 10) for topic in sorted(stamped_topics)]
+motor_publishers = [node.create_publisher(Float32MultiArray, topic, 10) for topic in sorted(motor_topics)]
+
+twist = Twist()
+stamped = TwistStamped()
+stamped.header.frame_id = f"{tf_prefix}base_link"
+motors = Float32MultiArray()
+motors.data = [0.0, 0.0, 0.0, 0.0]
+
+end_time = time.monotonic() + 0.8
+while time.monotonic() < end_time:
+    stamped.header.stamp = node.get_clock().now().to_msg()
+    for publisher in twist_publishers:
+        publisher.publish(twist)
+    for publisher in stamped_publishers:
+        publisher.publish(stamped)
+    for publisher in motor_publishers:
+        publisher.publish(motors)
+    rclpy.spin_once(node, timeout_sec=0.0)
+    time.sleep(0.05)
+
+node.destroy_node()
+rclpy.shutdown()
+PY
+}
+
+stop_lidar_motor() {
+  [ -f "$HOME/ros2_setup.sh" ] || return 0
+
+  set +u
+  # shellcheck disable=SC1090
+  source "$HOME/ros2_setup.sh"
+  set -u
+
+  local service services
+  services="$(timeout 2 ros2 service list 2>/dev/null | awk '/(^|\/)stop_motor$/ {print}' || true)"
+  [ -n "$services" ] || return 0
+
+  while IFS= read -r service; do
+    [ -n "$service" ] || continue
+    timeout 2 ros2 service call "$service" std_srvs/srv/Empty "{}" >/dev/null 2>&1 || true
+  done <<< "$services"
+}
+
+terminate_rosbot_processes() {
+  local pattern leftovers
+  local patterns=(
+    "[r]os2 launch rosbot_bringup"
+    "[r]os2 launch nav2_bringup"
+    "[r]os2 launch slam_toolbox"
+    "[r]os2 launch rplidar_ros"
+    "[r]obot_state_publisher"
+    "[j]oy_node"
+    "[t]eleop_node"
+    "[r]plidar_composition"
+    "[b]ridge_node"
+    "[t]f_namespace_bridge"
+    "[r]os2_control_node"
+    "[e]kf_node"
+    "[o]penni2_camera_driver"
+    "[/]image_transport[/]republish"
+    "[a]sync_slam_toolbox_node"
+    "[s]lam_toolbox"
+    "[m]ap_saver_cli"
+    "[m]ap_server"
+    "[a]mcl"
+    "[p]lanner_server"
+    "[c]ontroller_server"
+    "[s]moother_server"
+    "[b]ehavior_server"
+    "[b]t_navigator"
+    "[w]aypoint_follower"
+    "[v]elocity_smoother"
+    "[c]ollision_monitor"
+    "[l]ifecycle_manager"
+    "[r]osbot_twist_bridge.py"
+  )
+
+  for pattern in "${patterns[@]}"; do
+    terminate_matching_processes TERM "$pattern"
+  done
+
+  sleep 2
+
+  leftovers="$(rosbot_process_rows || true)"
+  if [ -n "$leftovers" ]; then
+    for pattern in "${patterns[@]}"; do
+      terminate_matching_processes KILL "$pattern"
+    done
+  fi
+}
+
+stop_robot_processes() {
+  send_zero_velocity
+  stop_lidar_motor
+  stop_twist_bridge
+  stop_battery_monitor
+  terminate_rosbot_processes
+  stop_lidar_motor_hold
+  start_lidar_motor_hold
+}
+
+stop_everything() {
+  stop_robot_processes
+  stop_monitor_processes
+}
+
+launch_rows() {
+  ps -eo pid=,comm=,args= \
+    | awk '
+      /ros2 launch rosbot_bringup/ &&
+      $2 !~ /^(awk|bash|sh|timeout|python|python3|grep)$/ {
+        print
+      }'
+}
+
+mode_from_launch_line() {
+  local line="$1"
+  if [[ "$line" == *rosbot2_nav_slam.launch.py* ]]; then
+    printf 'nav'
+  elif [[ "$line" == *rosbot2_nav_map.launch.py* ]]; then
+    printf 'map'
+  elif [[ "$line" == *rosbot2_slam.launch.py* ]]; then
+    printf 'slam'
+  elif [[ "$line" == *rosbot2_full.launch.py* ]]; then
+    printf 'base'
+  else
+    printf 'unknown'
+  fi
+}
+
+validate_no_positionals() {
+  local mode="$1"
+  if [ "${#positionals[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  error "Unexpected argument for '${mode}': ${positionals[*]}"
+  if [ "$mode" = "slam" ] && [ "${positionals[0]:-}" = "nav" ]; then
+    info "Use './rosbot nav' for SLAM plus Nav2."
+  elif [ "$mode" = "base" ]; then
+    info "Use './rosbot slam', './rosbot nav', or './rosbot map MAP.yaml' to choose another mode."
+  fi
+  exit 2
+}
+
+guard_no_running_stack() {
+  local requested_mode="$1"
+  local rows first count active_mode active_pid active_camera active_lidar active_joy
+  rows="$(launch_rows || true)"
+  [ -n "$rows" ] || return 0
+
+  count="$(printf '%s\n' "$rows" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+  first="$(printf '%s\n' "$rows" | head -n 1)"
+  active_pid="$(printf '%s\n' "$first" | awk '{print $1}')"
+  active_mode="$(mode_from_launch_line "$first")"
+  active_camera="$(printf '%s\n' "$first" | sed -n 's/.*start_camera:=\([^ ]*\).*/\1/p')"
+  active_lidar="$(printf '%s\n' "$first" | sed -n 's/.*start_lidar:=\([^ ]*\).*/\1/p')"
+  active_joy="$(printf '%s\n' "$first" | sed -n 's/.*start_joy:=\([^ ]*\).*/\1/p')"
+
+  banner
+  if [ "$count" -gt 1 ]; then
+    error "Multiple ROSbot stacks are already running."
+    printf '%s\n' "$rows" | awk '{printf "  PID %-7s %s\n", $1, $0}'
+    section "Fix"
+    printf '  Run %b./rosbot stop%b, then start exactly one mode.\n' "$CYAN" "$RESET"
+    printf '  Example: %b./rosbot nav --camera%b\n' "$CYAN" "$RESET"
+    exit 1
+  fi
+
+  if [ "$active_mode" = "$requested_mode" ]; then
+    warn "ROSbot ${active_mode} is already running."
+  else
+    warn "ROSbot ${active_mode} is already running; not starting ${requested_mode} on top of it."
+  fi
+  section "Current Stack"
+  field "Mode" "$active_mode"
+  field "PID" "$active_pid"
+  field "Camera" "$(bool_word "${active_camera:-$camera}")"
+  field "Lidar" "$(bool_word "${active_lidar:-$lidar}")"
+  field "Joystick" "$(bool_word "${active_joy:-$joy}")"
+  section "What To Do"
+  printf '  %-32s %s\n' "./rosbot status" "inspect the running stack"
+  printf '  %-32s %s\n' "./rosbot restart ${requested_mode}" "stop current stack and start ${requested_mode}"
+  printf '  %-32s %s\n' "./rosbot stop" "stop the running stack"
+  if [ "$requested_mode" = "base" ] && is_true "$camera"; then
+    printf '\n  To enable camera on the running base stack, use: %b./rosbot restart base --camera%b\n' "$CYAN" "$RESET"
+  fi
+  exit 1
+}
+
+run_cmd() {
+  if [ "$verbose" = "true" ] || [ "$dry_run" = "true" ]; then
+    quote_cmd "$@"
+  fi
+  if [ "$dry_run" = "true" ]; then
+    return 0
+  fi
+  exec "$@"
+}
+
+next_actions() {
+  section "Next"
+  printf '  %-18s %s\n' "./rosbot status" "check robot state"
+  printf '  %-18s %s\n' "./rosbot monitor" "watch live status"
+  printf '  %-18s %s\n' "./rosbot logs" "follow ROS launch output"
+  printf '  %-18s %s\n' "./rosbot stop" "stop all ROSbot processes"
+}
+
+run_launch_cmd() {
+  local launch_mode="$1"
+  shift
+
+  if [ "$dry_run" != "true" ]; then
+    guard_no_running_stack "$launch_mode"
+    if [ "$(bool_launch "$lidar")" = "True" ]; then
+      stop_lidar_motor_hold
+    else
+      start_lidar_motor_hold
+    fi
+  fi
+
+  if [ "$verbose" = "true" ]; then
+    banner
+    info "Verbose mode: streaming ROS launch output in this terminal."
+    start_battery_monitor
+    start_twist_bridge
+    quote_cmd "$@"
+    exec "$@"
+  fi
+  if [ "$dry_run" = "true" ]; then
+    quote_cmd "$@"
+    return 0
+  fi
+
+  mkdir -p "$LOG_DIR"
+  local safe_command safe_namespace stamp log pid_file pid
+  safe_command="$(sanitize_name "$launch_mode")"
+  safe_namespace="$(sanitize_name "${namespace:-base}")"
+  stamp="$(date '+%Y%m%d-%H%M%S')"
+  log="$LOG_DIR/${safe_command}-${safe_namespace}-${stamp}.log"
+  pid_file="$RUN_DIR/${safe_command}.pid"
+
+  nohup "$@" >"$log" 2>&1 < /dev/null &
+  pid="$!"
+  echo "$pid" > "$pid_file"
+  sleep 1
+
+  banner
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    start_battery_monitor
+    start_twist_bridge
+    ok "started ${launch_mode}"
+    section "Launch"
+    field "Mode" "$launch_mode"
+    field "PID" "$pid"
+    field "Namespace" "$(display_namespace "$namespace")"
+    field "Camera" "$(bool_word "$camera")"
+    field "Lidar" "$(bool_word "$lidar")"
+    field "Joystick" "$(bool_word "$joy")"
+    field "Twist teleop" "$(twist_bridge_status)"
+    field "Battery safe" "$(battery_monitor_status)"
+    field "Log" "$log"
+    next_actions
+    return 0
+  fi
+
+  error "ROSbot ${command} failed to start."
+  section "Last Log Lines"
+  tail -n 40 "$log" >&2 || true
+  return 1
+}
+
+require_args() {
+  local expected="$1"
+  shift
+  if [ "$#" -lt "$expected" ]; then
+    error "Missing arguments."
+    usage >&2
+    exit 2
+  fi
+}
+
+require_exact_positionals() {
+  local expected="$1"
+  local label="$2"
+  if [ "${#positionals[@]}" -lt "$expected" ]; then
+    error "Missing arguments for '${label}'."
+    usage >&2
+    exit 2
+  fi
+  if [ "${#positionals[@]}" -gt "$expected" ]; then
+    error "Too many arguments for '${label}': ${positionals[*]}"
+    exit 2
+  fi
+}
+
+require_at_most_positionals() {
+  local expected="$1"
+  local label="$2"
+  if [ "${#positionals[@]}" -gt "$expected" ]; then
+    error "Too many arguments for '${label}': ${positionals[*]}"
+    exit 2
+  fi
+}
+
+set_namespace() {
+  namespace="$(normalize_namespace "$1")"
+  launch_args_common=()
+  if [ -n "$namespace" ]; then
+    launch_args_common+=("namespace:=$namespace")
+    export ROBOT_NAMESPACE="$namespace"
+  else
+    unset ROBOT_NAMESPACE 2>/dev/null || true
+  fi
+}
+
+status_view() {
+  local dds thermal processes latest launches launch_line running active_mode active_namespace active_camera active_lidar active_joy
+  local dds_iface dds_addr dds_profile ssid signal rx_rate tx_rate
+  local cpu_temp gpu_temp cpu_freq guard_state
+  local battery battery_available battery_percent battery_voltage battery_current battery_status battery_external battery_health battery_technology battery_cells battery_alert battery_timer battery_topic_display battery_age battery_timestamp
+  local battery_power_trend battery_power_trend_source battery_power_trend_window battery_power_trend_delta_voltage battery_power_trend_delta_percentage
+
+  dds="$("$HOME/bin/rosbot-dds-status" 2>/dev/null || true)"
+  thermal="$("$HOME/bin/rosbot-thermal-status" 2>/dev/null || true)"
+  processes="$(process_rows || true)"
+  launches="$(launch_rows || true)"
+  launch_line="$(printf '%s\n' "$launches" | head -n 1)"
+  latest="$(latest_log || true)"
+
+  if [ -n "$launches" ]; then
+    running="${GREEN}running${RESET}"
+    active_mode="$(mode_from_launch_line "$launch_line")"
+  else
+    running="${MUTED}stopped${RESET}"
+    active_mode="none"
+  fi
+
+  active_namespace="$(printf '%s\n' "$launch_line" | sed -n 's/.*namespace:=\([^ ]*\).*/\1/p' | head -n 1)"
+  [ -n "$active_namespace" ] || active_namespace="$namespace"
+  active_camera="$(printf '%s\n' "$launch_line" | sed -n 's/.*start_camera:=\([^ ]*\).*/\1/p' | head -n 1)"
+  active_lidar="$(printf '%s\n' "$launch_line" | sed -n 's/.*start_lidar:=\([^ ]*\).*/\1/p' | head -n 1)"
+  active_joy="$(printf '%s\n' "$launch_line" | sed -n 's/.*start_joy:=\([^ ]*\).*/\1/p' | head -n 1)"
+  if [ -n "$launches" ]; then
+    [ -n "$active_camera" ] || active_camera="$camera"
+    [ -n "$active_lidar" ] || active_lidar="$lidar"
+    [ -n "$active_joy" ] || active_joy="$joy"
+  else
+    active_camera=false
+    active_lidar=false
+    active_joy=false
+  fi
+
+  dds_iface="$(printf '%s\n' "$dds" | awk -F= '/^ROSBOT_DDS_SELECTED_INTERFACE=/{print $2; exit}')"
+  dds_addr="$(printf '%s\n' "$dds" | awk -F= '/^ROSBOT_DDS_SELECTED_ADDRESS=/{print $2; exit}')"
+  dds_profile="$(printf '%s\n' "$dds" | awk -F= '/^FASTDDS_DEFAULT_PROFILES_FILE=/{print $2; exit}')"
+  ssid="$(printf '%s\n' "$dds" | awk -F': ' '/SSID:/{print $2; exit}')"
+  signal="$(printf '%s\n' "$dds" | awk -F': ' '/signal:/{print $2; exit}')"
+  rx_rate="$(printf '%s\n' "$dds" | awk -F': ' '/rx bitrate:/{split($2, a, " "); print a[1] " " a[2]; exit}')"
+  tx_rate="$(printf '%s\n' "$dds" | awk -F': ' '/tx bitrate:/{split($2, a, " "); print a[1] " " a[2]; exit}')"
+
+  cpu_temp="$(printf '%s\n' "$thermal" | awk '/cpu-thermal/{print $2 " " $3; exit}')"
+  gpu_temp="$(printf '%s\n' "$thermal" | awk '/gpu-thermal/{print $2 " " $3; exit}')"
+  cpu_freq="$(printf '%s\n' "$thermal" | awk '/scaling_cur_freq/{print $2 " " $3; exit}')"
+  guard_state="$(printf '%s\n' "$thermal" | sed -n 's/^[[:space:]]*Active: //p' | awk '{print $1 " " $2; exit}')"
+
+  battery="$(battery_cache_raw || true)"
+  battery_available="$(battery_value "$battery" available)"
+  battery_percent="$(battery_value "$battery" percentage)"
+  battery_voltage="$(battery_value "$battery" voltage)"
+  battery_current="$(battery_value "$battery" current)"
+  battery_status="$(battery_value "$battery" status)"
+  battery_external="$(battery_value "$battery" external_power)"
+  battery_health="$(battery_value "$battery" health)"
+  battery_technology="$(battery_value "$battery" technology)"
+  battery_cells="$(battery_value "$battery" cell_voltage)"
+  battery_alert="$(battery_value "$battery" alert)"
+  battery_timer="$(battery_value "$battery" timer_remaining)"
+  battery_topic_display="$(battery_value "$battery" topic)"
+  battery_timestamp="$(battery_value "$battery" timestamp)"
+  battery_power_trend="$(battery_value "$battery" power_trend)"
+  battery_power_trend_source="$(battery_value "$battery" power_trend_source)"
+  battery_power_trend_window="$(battery_value "$battery" power_trend_window)"
+  battery_power_trend_delta_voltage="$(battery_value "$battery" power_trend_delta_voltage)"
+  battery_power_trend_delta_percentage="$(battery_value "$battery" power_trend_delta_percentage)"
+  if [[ "$battery_timestamp" =~ ^[0-9]+$ ]]; then
+    battery_age="$(( $(date +%s) - battery_timestamp ))s ago"
+  else
+    battery_age="unknown"
+  fi
+
+  banner
+  section "Runtime"
+  field "Stack" "$running"
+  field "Mode" "$active_mode"
+  field "Namespace" "$(display_namespace "$active_namespace")"
+  field "Camera" "$(bool_word "$active_camera")"
+  field "Lidar" "$(bool_word "$active_lidar")"
+  if is_true "$active_lidar"; then
+    field "Lidar motor" "${GREEN}driver active${RESET}"
+  else
+    field "Lidar motor" "$(lidar_hold_status)"
+  fi
+  field "Joystick" "$(bool_word "$active_joy")"
+  field "Twist teleop" "$(twist_bridge_status)"
+  field "Battery safe" "$(battery_monitor_status)"
+  field "Env file" "$(env_file_status)"
+  field "ROS domain" "${ROS_DOMAIN_ID:-0}"
+  field "RMW" "${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+
+  section "Battery"
+  if [ "$battery_available" = "true" ]; then
+    field "Charge" "$(percent_word "${battery_percent:-}")"
+    field "Voltage" "${battery_voltage:-unknown}${battery_voltage:+ V}"
+    field "Current" "${battery_current:-unknown}${battery_current:+ A}"
+    field "Power" "${battery_external:-unknown}"
+    field "Trend" "$(battery_trend_display "${battery_power_trend:-unknown}" "$battery_power_trend_source" "$battery_power_trend_window" "$battery_power_trend_delta_voltage" "$battery_power_trend_delta_percentage")"
+    field "Status" "${battery_status:-unknown}"
+    field "Health" "${battery_health:-unknown}"
+    field "Technology" "${battery_technology:-unknown}"
+    field "Cells" "${battery_cells:-unknown}"
+    field "Alert" "$(alert_word "${battery_alert:-unknown}")"
+    if [ "${battery_alert:-}" = "critical" ] && [ -n "$battery_timer" ]; then
+      field "Auto-stop" "in ${battery_timer}s"
+    else
+      field "Auto-stop" "$(battery_monitor_status)"
+    fi
+    field "Updated" "$battery_age"
+    field "Topic" "${battery_topic_display:-$(battery_topic_name)}"
+  else
+    field "State" "unknown"
+    field "Topic" "${battery_topic_display:-$(battery_topic_name)}"
+    field "Auto-stop" "$(battery_monitor_status)"
+  fi
+
+  section "Network"
+  field "DDS iface" "${dds_iface:-unknown}"
+  field "DDS address" "${dds_addr:-unknown}"
+  field "Wi-Fi" "${ssid:-unknown}${signal:+ (${signal})}"
+  field "RX bitrate" "${rx_rate:-unknown}"
+  field "TX bitrate" "${tx_rate:-unknown}"
+  field "DDS profile" "${dds_profile:-unknown}"
+
+  section "Thermal"
+  field "CPU" "$(temp_word "${cpu_temp:-}")"
+  field "GPU" "$(temp_word "${gpu_temp:-}")"
+  field "CPU freq" "${cpu_freq:-unknown}"
+  field "Guard" "${guard_state:-unknown}"
+
+  section "Processes"
+  if [ -z "$processes" ]; then
+    printf '  %bnone%b\n' "$MUTED" "$RESET"
+  else
+    printf '  %-7s %-18s %s\n' "PID" "Process" "Role"
+    printf '%s\n' "$processes" | awk '
+      {
+        role="node"
+        if ($0 ~ /ros2 launch rosbot_bringup/) role="launch"
+        else if ($0 ~ /rplidar/) role="lidar"
+        else if ($0 ~ /openni2/) role="camera"
+        else if ($0 ~ /ros2_control/) role="control"
+        else if ($0 ~ /slam_toolbox/) role="slam"
+        else if ($0 ~ /controller_server|planner_server|bt_navigator/) role="nav2"
+        else if ($0 ~ /rosbot_battery_monitor/) role="battery"
+        printf "  %-7s %-18s %s\n", $1, $2, role
+      }'
+  fi
+
+  section "Logs"
+  if [ -n "$latest" ]; then
+    field "Latest" "$latest"
+    field "Follow" "./rosbot logs"
+  else
+    printf '  %bnone yet%b\n' "$MUTED" "$RESET"
+  fi
+}
+
+monitor_view_once() {
+  status_view
+  local latest
+  latest="$(latest_log || true)"
+  section "Recent Log"
+  if [ -n "$latest" ] && [ -f "$latest" ]; then
+    printf '  %b%s%b\n' "$MUTED" "$latest" "$RESET"
+    tail -n 14 "$latest" \
+      | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' \
+      | awk -v width="${COLUMNS:-120}" '{
+          limit = width - 4
+          if (limit < 60) limit = 116
+          if (length($0) > limit) print "  " substr($0, 1, limit - 3) "..."
+          else print "  " $0
+        }'
+  else
+    printf '  %bnone yet%b\n' "$MUTED" "$RESET"
+  fi
+}
+
+monitor_live() {
+  if [ ! -t 1 ]; then
+    monitor_view_once
+    return 0
+  fi
+
+  mkdir -p "$RUN_DIR"
+  echo "$$" > "$RUN_DIR/monitor.pid"
+
+  monitor_cleanup() {
+    local pid_file="$RUN_DIR/monitor.pid"
+    local pid=""
+    if [ -f "$pid_file" ]; then
+      pid="$(cat "$pid_file" 2>/dev/null || true)"
+      if [ "$pid" = "$$" ]; then
+        rm -f "$pid_file"
+      fi
+    fi
+    tput cnorm 2>/dev/null || true
+    tput sgr0 2>/dev/null || true
+    tput rmcup 2>/dev/null || true
+  }
+
+  trap 'monitor_cleanup; exit 0' INT TERM
+  trap 'monitor_cleanup' EXIT
+
+  if ! command -v tput >/dev/null 2>&1 || ! tput cols >/dev/null 2>&1; then
+    while true; do
+      printf '\033[H'
+      monitor_view_once
+      printf '\n%bPress Ctrl-C to exit. Refresh: %ss%b\n' "$MUTED" "$monitor_interval" "$RESET"
+      sleep "$monitor_interval"
+    done
+  fi
+
+  local output footer footer_row i max_rows clear_start
+  local -a current_lines=()
+  local -a previous_lines=()
+  local previous_count=0
+
+  tput smcup 2>/dev/null || true
+  tput civis 2>/dev/null || true
+  tput clear 2>/dev/null || true
+
+  while true; do
+    output="$(monitor_view_once)"
+    mapfile -t current_lines <<< "$output"
+    max_rows="${#current_lines[@]}"
+
+    for ((i = 0; i < max_rows; i++)); do
+      if [[ ! ${previous_lines[$i]+_} || "${previous_lines[$i]}" != "${current_lines[$i]}" ]]; then
+        tput cup "$i" 0 2>/dev/null || printf '\033[%d;1H' "$((i + 1))"
+        tput el 2>/dev/null || printf '\033[K'
+        printf '%s' "${current_lines[$i]}"
+      fi
+    done
+
+    clear_start="$max_rows"
+    if [ "$previous_count" -gt "$clear_start" ]; then
+      for ((i = clear_start; i < previous_count; i++)); do
+        tput cup "$i" 0 2>/dev/null || printf '\033[%d;1H' "$((i + 1))"
+        tput el 2>/dev/null || printf '\033[K'
+      done
+    fi
+
+    footer="${MUTED}Press Ctrl-C to exit. Updating changed rows every ${monitor_interval}s.${RESET}"
+    footer_row="$((max_rows + 1))"
+    tput cup "$footer_row" 0 2>/dev/null || printf '\033[%d;1H' "$((footer_row + 1))"
+    tput el 2>/dev/null || printf '\033[K'
+    printf '%b' "$footer"
+
+    previous_lines=("${current_lines[@]}")
+    previous_count="$((max_rows + 2))"
+    sleep "$monitor_interval"
+  done
+}
+
+launch_args_common=()
+set_namespace "$namespace"
+
+if [ "$#" -eq 0 ]; then
+  usage
+  exit 0
+fi
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+command="${1:-help}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+positionals=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --namespace)
+      set_namespace "${2:-}"
+      shift 2
+      ;;
+    --camera)
+      camera=true
+      shift
+      ;;
+    --no-camera)
+      camera=false
+      shift
+      ;;
+    --lidar)
+      lidar=true
+      shift
+      ;;
+    --no-lidar)
+      lidar=false
+      shift
+      ;;
+    --joy)
+      joy=true
+      shift
+      ;;
+    --no-joy)
+      joy=false
+      shift
+      ;;
+    --verbose)
+      verbose=true
+      shift
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    --battery-safety)
+      battery_safety=true
+      shift
+      ;;
+    --no-battery-safety|--disable-battery-safety)
+      battery_safety=false
+      shift
+      ;;
+    --battery-warn-percent)
+      battery_warn_percent="${2:-}"
+      shift 2
+      ;;
+    --battery-topic)
+      battery_topic="${2:-}"
+      shift 2
+      ;;
+    --battery-stop-percent)
+      battery_stop_percent="${2:-}"
+      shift 2
+      ;;
+    --battery-stop-delay)
+      battery_stop_delay="${2:-}"
+      shift 2
+      ;;
+    --battery-stop-timeout)
+      battery_stop_timeout="${2:-}"
+      shift 2
+      ;;
+    --battery-trend-window)
+      battery_trend_window="${2:-}"
+      shift 2
+      ;;
+    --battery-trend-min-dv)
+      battery_trend_min_dv="${2:-}"
+      shift 2
+      ;;
+    --yes)
+      yes=true
+      shift
+      ;;
+    --once)
+      monitor_once=true
+      shift
+      ;;
+    --interval)
+      monitor_interval="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [ "$#" -gt 0 ]; do
+        positionals+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      error "Unknown option: $1"
+      exit 2
+      ;;
+    *)
+      positionals+=("$1")
+      shift
+      ;;
+  esac
+done
+
+case "$command" in
+  base|driver|drivers)
+    command="base"
+    ;;
+  mapping)
+    command="slam"
+    ;;
+  navigation)
+    command="nav"
+    ;;
+  start)
+    if [ "${#positionals[@]}" -eq 0 ]; then
+      command="base"
+    else
+      start_mode="${positionals[0]}"
+      positionals=("${positionals[@]:1}")
+      case "$start_mode" in
+        base|driver|drivers)
+          command="base"
+          ;;
+        slam|mapping)
+          command="slam"
+          ;;
+        nav|navigation)
+          command="nav"
+          ;;
+        map)
+          command="map"
+          ;;
+        *)
+          error "'start' expects one mode: base, slam, nav, or map."
+          section "Examples"
+          printf '  %b./rosbot start%b\n' "$CYAN" "$RESET"
+          printf '  %b./rosbot start slam%b\n' "$CYAN" "$RESET"
+          printf '  %b./rosbot start nav --camera%b\n' "$CYAN" "$RESET"
+          printf '  %b./rosbot start map ~/maps/room.yaml%b\n' "$CYAN" "$RESET"
+          exit 2
+          ;;
+      esac
+    fi
+    ;;
+esac
+
+camera_arg="start_camera:=$(bool_launch "$camera")"
+lidar_arg="start_lidar:=$(bool_launch "$lidar")"
+joy_arg="start_joy:=$(bool_launch "$joy")"
+
+case "$command" in
+  help)
+    usage
+    ;;
+
+  base)
+    validate_no_positionals "base"
+    run_launch_cmd "base" "$HOME/bin/rosbot-full" "$camera_arg" "$lidar_arg" "$joy_arg" "${launch_args_common[@]}"
+    ;;
+
+  slam)
+    validate_no_positionals "slam"
+    if [ "$(bool_launch "$lidar")" = "False" ]; then
+      error "SLAM requires lidar; remove --no-lidar."
+      exit 2
+    fi
+    run_launch_cmd "slam" "$HOME/bin/rosbot-slam" "$camera_arg" "$joy_arg" "${launch_args_common[@]}"
+    ;;
+
+  nav)
+    validate_no_positionals "nav"
+    if [ "$(bool_launch "$lidar")" = "False" ]; then
+      error "Navigation with live SLAM requires lidar; remove --no-lidar."
+      exit 2
+    fi
+    run_launch_cmd "nav" "$HOME/bin/rosbot-nav-slam" "$camera_arg" "$joy_arg" "${launch_args_common[@]}"
+    ;;
+
+  map)
+    require_exact_positionals 1 "map"
+    if [ "$(bool_launch "$lidar")" = "False" ]; then
+      error "Saved-map navigation requires lidar; remove --no-lidar."
+      exit 2
+    fi
+    run_launch_cmd "map" "$HOME/bin/rosbot-nav-map" "${positionals[0]}" "$camera_arg" "$joy_arg" "${launch_args_common[@]}"
+    ;;
+
+  restart)
+    restart_mode="${positionals[0]:-}"
+    if [ -z "$restart_mode" ]; then
+      active_line="$(launch_rows | head -n 1 || true)"
+      if [ -n "$active_line" ]; then
+        restart_mode="$(mode_from_launch_line "$active_line")"
+      else
+        restart_mode="base"
+      fi
+    else
+      positionals=("${positionals[@]:1}")
+    fi
+
+    case "$restart_mode" in
+      base|driver|drivers|start)
+        restart_mode="base"
+        validate_no_positionals "restart base"
+        ;;
+      slam|mapping)
+        restart_mode="slam"
+        validate_no_positionals "restart slam"
+        ;;
+      nav|navigation)
+        restart_mode="nav"
+        validate_no_positionals "restart nav"
+        ;;
+      map)
+        restart_mode="map"
+        require_exact_positionals 1 "restart map"
+        ;;
+      *)
+        error "Unknown restart mode: $restart_mode"
+        info "Use one of: base, slam, nav, map MAP.yaml"
+        exit 2
+        ;;
+    esac
+
+    if [ "$dry_run" = "true" ]; then
+      printf '# stop current ROSbot stack without sudo\n'
+      printf '# publish zero velocity, call /stop_motor, terminate ROS nodes, hold lidar motor stopped\n'
+      case "$restart_mode" in
+        base)
+          quote_cmd "$HOME/bin/rosbot-full" "$camera_arg" "$lidar_arg" "$joy_arg" "${launch_args_common[@]}"
+          ;;
+        slam)
+          quote_cmd "$HOME/bin/rosbot-slam" "$camera_arg" "$joy_arg" "${launch_args_common[@]}"
+          ;;
+        nav)
+          quote_cmd "$HOME/bin/rosbot-nav-slam" "$camera_arg" "$joy_arg" "${launch_args_common[@]}"
+          ;;
+        map)
+          quote_cmd "$HOME/bin/rosbot-nav-map" "${positionals[0]}" "$camera_arg" "$joy_arg" "${launch_args_common[@]}"
+          ;;
+      esac
+      exit 0
+    fi
+
+    banner
+    info "Stopping current ROSbot stack before starting ${restart_mode}."
+    stop_robot_processes
+    ok "stopped current stack"
+    case "$restart_mode" in
+      base)
+        run_launch_cmd "base" "$HOME/bin/rosbot-full" "$camera_arg" "$lidar_arg" "$joy_arg" "${launch_args_common[@]}"
+        ;;
+      slam)
+        if [ "$(bool_launch "$lidar")" = "False" ]; then
+          error "SLAM requires lidar; remove --no-lidar."
+          exit 2
+        fi
+        run_launch_cmd "slam" "$HOME/bin/rosbot-slam" "$camera_arg" "$joy_arg" "${launch_args_common[@]}"
+        ;;
+      nav)
+        if [ "$(bool_launch "$lidar")" = "False" ]; then
+          error "Navigation with live SLAM requires lidar; remove --no-lidar."
+          exit 2
+        fi
+        run_launch_cmd "nav" "$HOME/bin/rosbot-nav-slam" "$camera_arg" "$joy_arg" "${launch_args_common[@]}"
+        ;;
+      map)
+        if [ "$(bool_launch "$lidar")" = "False" ]; then
+          error "Saved-map navigation requires lidar; remove --no-lidar."
+          exit 2
+        fi
+        run_launch_cmd "map" "$HOME/bin/rosbot-nav-map" "${positionals[0]}" "$camera_arg" "$joy_arg" "${launch_args_common[@]}"
+        ;;
+    esac
+    ;;
+
+  logs)
+    require_at_most_positionals 1 "logs"
+    if [ "$dry_run" = "true" ]; then
+      echo "tail -n 120 -f ${LOG_DIR}/<latest>.log"
+      exit 0
+    fi
+    log_target="${positionals[0]:-}"
+    if [ -z "$log_target" ] || [ "$log_target" = "latest" ]; then
+      log_target="$(latest_log)"
+    fi
+    if [ -z "$log_target" ] || [ ! -f "$log_target" ]; then
+      error "No ROSbot log found in $LOG_DIR."
+      exit 1
+    fi
+    banner
+    section "Log Stream"
+    field "File" "$log_target"
+    printf '\n'
+    tail -n 120 -f "$log_target"
+    ;;
+
+  monitor)
+    require_at_most_positionals 1 "monitor"
+    if [ "$dry_run" = "true" ]; then
+      echo "open alternate screen and update changed rows every ${monitor_interval}s"
+      exit 0
+    fi
+    if [ "${#positionals[@]}" -gt 0 ]; then
+      monitor_interval="${positionals[0]}"
+    fi
+    if ! [[ "$monitor_interval" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      error "--interval must be a number."
+      exit 2
+    fi
+    if [ "$monitor_once" = "true" ]; then
+      monitor_view_once
+      exit 0
+    fi
+    monitor_live
+    ;;
+
+  teleop)
+    validate_no_positionals "teleop"
+    if [ "$dry_run" = "true" ]; then
+      quote_cmd ros2 run teleop_twist_keyboard teleop_twist_keyboard
+      exit 0
+    fi
+    banner
+    info "Running keyboard teleop. The robot bridge converts Twist to TwistStamped."
+    info "Press Ctrl-C to exit teleop."
+    if [ -f "$HOME/ros2_setup.sh" ]; then
+      exec bash -lc 'source "$HOME/ros2_setup.sh" && exec ros2 run teleop_twist_keyboard teleop_twist_keyboard'
+    fi
+    exec ros2 run teleop_twist_keyboard teleop_twist_keyboard
+    ;;
+
+  save-map)
+    require_at_most_positionals 1 "save-map"
+    save_args=()
+    if [ -n "$namespace" ]; then
+      save_args+=(--namespace "$namespace")
+    fi
+    if [ "${#positionals[@]}" -gt 0 ]; then
+      save_args+=("${positionals[@]}")
+    fi
+    run_cmd "$HOME/bin/rosbot-save-map" "${save_args[@]}"
+    ;;
+
+  goal)
+    require_exact_positionals 3 "goal"
+    if [ "$yes" != "true" ]; then
+      error "Refusing to send a movement goal without --yes."
+      exit 2
+    fi
+    goal_args=()
+    if [ -n "$namespace" ]; then
+      goal_args+=(--namespace "$namespace")
+    fi
+    goal_args+=(--i-understand-robot-may-move "${positionals[0]}" "${positionals[1]}" "${positionals[2]}")
+    run_cmd "$HOME/bin/rosbot-nav-goal" "${goal_args[@]}"
+    ;;
+
+  pose)
+    require_exact_positionals 3 "pose"
+    pose_args=()
+    if [ -n "$namespace" ]; then
+      pose_args+=(--namespace "$namespace")
+    fi
+    pose_args+=("${positionals[0]}" "${positionals[1]}" "${positionals[2]}")
+    run_cmd "$HOME/bin/rosbot-set-initial-pose" "${pose_args[@]}"
+    ;;
+
+  stop)
+    if [ "$dry_run" = "true" ]; then
+      bridge_pid="$(twist_bridge_pid || true)"
+      monitor_pid="$(monitor_pid || true)"
+      printf '# publish zero velocity to /cmd_vel, /cmd_vel_stamped, and motor command topics\n'
+      printf '# call any available /stop_motor lidar services\n'
+      if [ -n "$bridge_pid" ]; then
+        quote_cmd kill "$bridge_pid"
+      fi
+      if [ -n "$monitor_pid" ]; then
+        quote_cmd kill "$monitor_pid"
+      fi
+      printf '# terminate any remaining ROSbot ROS processes\n'
+      printf '# hold %s with DTR asserted so the RPLIDAR A1 motor stays stopped\n' "$lidar_port"
+      exit 0
+    fi
+    banner
+    stop_everything
+    remaining="$(rosbot_process_rows || true)"
+    if [ -n "$remaining" ]; then
+      warn "stop completed, but these ROSbot processes are still present:"
+      printf '%s\n' "$remaining" | awk '{printf "  PID %-7s %-18s %s\n", $1, $2, substr($0, index($0,$3))}'
+      exit 1
+    fi
+    if [ -e "$lidar_port" ] && [ -z "$(lidar_hold_pid)" ]; then
+      error "RPLIDAR motor holder is not running; physical lidar may still spin."
+      exit 1
+    fi
+    ok "stopped robot stack, lidar, bridge, and monitor"
+    ;;
+
+  status)
+    if [ "$dry_run" = "true" ]; then
+      quote_cmd "$HOME/bin/rosbot-check"
+      exit 0
+    fi
+    status_view
+    ;;
+
+  *)
+    error "Unknown command: $command"
+    usage >&2
+    exit 2
+    ;;
+esac

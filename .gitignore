@@ -1,0 +1,8 @@
+rosbot.env
+*.before_*
+__pycache__/
+*.pyc
+*.img
+*.img.xz
+*.img.zst
+*.log
