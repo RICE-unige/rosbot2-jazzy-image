@@ -125,6 +125,21 @@ You can override the config path with:
 ROSBOT_ENV_FILE=/path/to/rosbot.env ./rosbot status
 ```
 
+## Repository Layout
+
+```text
+.
+|-- rosbot                  # public CLI entrypoint
+|-- rosbot.env.example      # local configuration template
+|-- scripts/                # implementation helpers used by ./rosbot
+|-- README.md
+|-- RELEASE_NOTES.md
+|-- SHA256SUMS
+`-- LICENSE
+```
+
+Keep `rosbot` at the repository root so users can run `./rosbot ...` directly after cloning.
+
 ## Quick Start
 
 Start the base driver stack:

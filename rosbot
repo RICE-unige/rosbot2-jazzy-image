@@ -5,9 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${ROSBOT_ENV_FILE:-$SCRIPT_DIR/rosbot.env}"
 RUN_DIR="${ROSBOT_RUN_DIR:-$HOME/.rosbot}"
 LOG_DIR="${ROSBOT_LOG_DIR:-$RUN_DIR/logs}"
-TWIST_BRIDGE_SCRIPT="$SCRIPT_DIR/rosbot_twist_bridge.py"
-LIDAR_HOLD_SCRIPT="$SCRIPT_DIR/rosbot_lidar_motor_hold.py"
-BATTERY_MONITOR_SCRIPT="$SCRIPT_DIR/rosbot_battery_monitor.py"
+HELPER_DIR="$SCRIPT_DIR/scripts"
+TWIST_BRIDGE_SCRIPT="$HELPER_DIR/rosbot_twist_bridge.py"
+LIDAR_HOLD_SCRIPT="$HELPER_DIR/rosbot_lidar_motor_hold.py"
+BATTERY_MONITOR_SCRIPT="$HELPER_DIR/rosbot_battery_monitor.py"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   RESET=$'\033[0m'
