@@ -7,6 +7,12 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-community%20image-yellow)](#project-status)
 
+<p align="center">
+  <img src="https://husarion.com/assets/images/ROSbot_unboxing-d393720a14a85f2fd47dfa389230b821.jpg" alt="ROSbot 2.0 with lidar and RGB-D camera" width="720">
+  <br>
+  <sub>ROSbot 2.0 image from the Husarion ROSbot 2 quick-start guide.</sub>
+</p>
+
 Community Ubuntu 24.04 / Armbian image for running **ROS 2 Jazzy** on the original **Husarion ROSbot 2.0** with an **ASUS Tinker Board**.
 
 The image is intended to make an old ROSbot 2.0 usable with ROS 2 without rebuilding the full stack on the robot. It includes the compiled ROS 2 runtime, ROSbot overlay, RPLIDAR support, Orbbec Astra support, SLAM Toolbox, Nav2, compressed image transports, and the ROSbot base bridge.
