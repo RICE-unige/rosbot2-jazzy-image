@@ -6,6 +6,7 @@
 [![Hardware](https://img.shields.io/badge/hardware-ROSbot%202.0-blue)](#supported-hardware)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-community%20image-yellow)](#project-status)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20693851.svg)](https://doi.org/10.5281/zenodo.20693851)
 
 <p align="center">
   <img src="https://husarion.com/assets/images/ROSbot_unboxing-d393720a14a85f2fd47dfa389230b821.jpg" alt="ROSbot 2.0 with lidar and RGB-D camera" width="720">
@@ -57,22 +58,25 @@ What currently works:
 
 ## Download
 
-The compressed SD card image will be published as a GitHub Release asset.
+The compressed SD card image is distributed through Zenodo:
 
 ```text
-Release image: coming soon
+DOI:     10.5281/zenodo.20693851
+Record:  https://zenodo.org/records/20693851
+Image:   rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz
 ```
 
 Always verify the downloaded image before flashing:
 
 ```bash
 sha256sum -c SHA256SUMS
+gzip -t rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz
 ```
 
 On Windows, use a checksum tool or PowerShell:
 
 ```powershell
-Get-FileHash .\rosbot2-jazzy-image.img.xz -Algorithm SHA256
+Get-FileHash .\rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz -Algorithm SHA256
 ```
 
 ## Flash
