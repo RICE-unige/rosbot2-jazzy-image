@@ -58,22 +58,42 @@ What currently works:
 
 ## Download
 
-The compressed SD card image is distributed through Zenodo:
+The public SD-card image is hosted on Zenodo.
+
+<p>
+  <a href="https://zenodo.org/records/20693851/files/rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz?download=1"><strong>Download the ROSbot 2.0 Jazzy image (.img.gz)</strong></a>
+  |
+  <a href="https://zenodo.org/records/20693851">View the Zenodo record</a>
+  |
+  <a href="https://doi.org/10.5281/zenodo.20693851">DOI</a>
+</p>
 
 ```text
-DOI:     10.5281/zenodo.20693851
-Record:  https://zenodo.org/records/20693851
-Image:   rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz
+Image:             rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz
+Minimum SD card:   32 GB
+Compressed SHA256: 99b65763f5f729f476b746b5a2f94662fe1af6623ec657544f8e4d55e5c4cd3b
+Raw image SHA256:  16fcee65a6e91df261674c061dfc05ef1c81955bbf3298b2d3e5e6e9d3448303
 ```
 
-Always verify the downloaded image before flashing:
+Download `SHA256SUMS` from the same Zenodo record and verify the image before flashing.
+
+Ubuntu/Linux:
 
 ```bash
-sha256sum -c SHA256SUMS
+cd ~/Downloads
+sha256sum -c SHA256SUMS --ignore-missing
 gzip -t rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz
 ```
 
-On Windows, use a checksum tool or PowerShell:
+macOS:
+
+```bash
+cd ~/Downloads
+shasum -a 256 rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz
+gzip -t rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz
+```
+
+Windows PowerShell:
 
 ```powershell
 Get-FileHash .\rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz -Algorithm SHA256
@@ -81,13 +101,84 @@ Get-FileHash .\rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz -Algorithm 
 
 ## Flash
 
-Flash the image to a microSD card using Raspberry Pi Imager, Balena Etcher, or `dd`.
+> [!WARNING]
+> Flashing overwrites the selected SD card. Double-check the target drive before starting.
+
+Use a 32 GB or larger microSD card.
+
+### balenaEtcher
+
+[balenaEtcher](https://www.balena.io/etcher) is the simplest cross-platform option for Windows, Ubuntu/Linux, and macOS.
+
+1. Open balenaEtcher.
+2. Choose **Flash from file**.
+3. Select `rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz`.
+4. Choose the target microSD card.
+5. Select **Flash** and wait for validation to finish.
+6. Eject the SD card safely.
+
+balenaEtcher can flash the compressed `.img.gz` file directly.
+
+### Rufus
+
+[Rufus](https://rufus.ie/) is a good Windows option.
+
+1. Insert the microSD card into the Windows PC.
+2. Open Rufus.
+3. In **Device**, select the microSD card.
+4. In **Boot selection**, choose `rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz`.
+5. Select **Start**.
+6. If Rufus asks for the write mode, choose **DD Image mode**.
+7. Wait for Rufus to finish, then eject the SD card safely.
+
+Rufus supports compressed bootable disk images. If your Rufus version refuses the `.img.gz`, decompress it first and select the resulting `.img` file.
+
+### Ubuntu/Linux Command Line
+
+Use this only if you are comfortable identifying raw block devices.
+
+```bash
+lsblk
+```
+
+Find the SD card device, for example `/dev/sdX`. Use the whole device, not a partition such as `/dev/sdX1`.
+
+```bash
+cd ~/Downloads
+gunzip -c rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz | sudo dd of=/dev/sdX bs=16M status=progress conv=fsync
+sync
+```
+
+Replace `/dev/sdX` with the real SD card device.
+
+### macOS Command Line
+
+Use this only if you are comfortable identifying raw disks.
+
+```bash
+diskutil list
+```
+
+Find the SD card disk, for example `/dev/diskN`, then unmount it:
+
+```bash
+diskutil unmountDisk /dev/diskN
+cd ~/Downloads
+gunzip -c rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz | sudo dd of=/dev/rdiskN bs=16m
+sync
+diskutil eject /dev/diskN
+```
+
+Replace `diskN` and `rdiskN` with the real SD card disk number.
+
+## First Boot
 
 1. Power off the robot.
 2. Insert the flashed microSD card.
-3. Boot the robot.
-4. Find the robot IP from your router, scanner, display, or serial console.
-5. SSH into the robot:
+3. Connect an Ethernet cable to the robot for the first boot.
+4. Boot the robot.
+5. Find the robot IP from your router, DHCP leases page, or a network scanner.
+6. SSH into the robot:
 
 ```bash
 ssh husarion@ROBOT_IP
