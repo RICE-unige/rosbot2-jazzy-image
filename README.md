@@ -71,6 +71,8 @@ The public SD-card image is hosted on Zenodo.
 ```text
 Image:             rosbot2-jazzy-tinkerboard-ubuntu24.04-20260614.img.gz
 Minimum SD card:   32 GB
+Compressed size:   15148403212 bytes (15.15 GB / 14.11 GiB)
+Raw image size:    25848446976 bytes (25.85 GB / 24.07 GiB)
 Compressed SHA256: 99b65763f5f729f476b746b5a2f94662fe1af6623ec657544f8e4d55e5c4cd3b
 Raw image SHA256:  16fcee65a6e91df261674c061dfc05ef1c81955bbf3298b2d3e5e6e9d3448303
 ```
@@ -229,6 +231,7 @@ ROSBOT_ENV_FILE=/path/to/rosbot.env ./rosbot status
 |-- scripts/                # implementation helpers used by ./rosbot
 |-- README.md
 |-- RELEASE_NOTES.md
+|-- THIRD_PARTY_LICENSE_NOTES.txt
 |-- SHA256SUMS
 `-- LICENSE
 ```

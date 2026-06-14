@@ -3,6 +3,7 @@ rosbot.env
 __pycache__/
 *.pyc
 *.img
+*.img.gz
 *.img.xz
 *.img.zst
 *.log

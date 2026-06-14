@@ -1,0 +1,16 @@
+ROSbot 2.0 ROS 2 Jazzy SD-card image third-party license notes
+================================================================
+
+The companion repository scripts and documentation are distributed under
+the repository license.
+
+The published SD-card image is a full operating-system image. It includes
+upstream operating-system packages, ROS packages, drivers, firmware, and
+third-party software under their respective upstream licenses.
+
+Users who redistribute modified images are responsible for reviewing and
+complying with the licenses of the upstream components included in their
+modified image.
+
+This project is not an official image from Husarion, ASUS, Canonical, Open
+Robotics, or the ROS project.
