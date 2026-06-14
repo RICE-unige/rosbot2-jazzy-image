@@ -11,6 +11,7 @@ LIDAR_HOLD_SCRIPT="$HELPER_DIR/rosbot_lidar_motor_hold.py"
 BATTERY_MONITOR_SCRIPT="$HELPER_DIR/rosbot_battery_monitor.py"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  TRUECOLOR=true
   RESET=$'\033[0m'
   BOLD=$'\033[1m'
   DIM=$'\033[2m'
@@ -20,7 +21,9 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   BLUE=$'\033[38;5;39m'
   CYAN=$'\033[38;5;51m'
   MUTED=$'\033[38;5;244m'
+  DARK=$'\033[38;2;5;8;16m'
 else
+  TRUECOLOR=false
   RESET=""
   BOLD=""
   DIM=""
@@ -30,6 +33,7 @@ else
   BLUE=""
   CYAN=""
   MUTED=""
+  DARK=""
 fi
 
 if [ -f "$ENV_FILE" ]; then
@@ -59,9 +63,72 @@ dry_run=false
 yes=false
 monitor_once=false
 
+PAL_R=(0 72 181 255 255)
+PAL_G=(194 92 83 91 190)
+PAL_B=(255 255 255 196 72)
+
+gradient_rgb() {
+  local x="$1"
+  local max="$2"
+  local scaled segment rem r g b
+  if [ "$max" -le 0 ]; then
+    printf '0;194;255'
+    return 0
+  fi
+  scaled=$(( x * 4000 / max ))
+  segment=$(( scaled / 1000 ))
+  if [ "$segment" -gt 3 ]; then
+    segment=3
+  fi
+  rem=$(( scaled - (segment * 1000) ))
+  r=$(( PAL_R[segment] + ((PAL_R[segment + 1] - PAL_R[segment]) * rem / 1000) ))
+  g=$(( PAL_G[segment] + ((PAL_G[segment + 1] - PAL_G[segment]) * rem / 1000) ))
+  b=$(( PAL_B[segment] + ((PAL_B[segment + 1] - PAL_B[segment]) * rem / 1000) ))
+  printf '%s;%s;%s' "$r" "$g" "$b"
+}
+
+center_text() {
+  local text="$1"
+  local width="$2"
+  local len left right
+  len="${#text}"
+  if [ "$len" -ge "$width" ]; then
+    printf '%s' "${text:0:width}"
+    return 0
+  fi
+  left=$(( (width - len) / 2 ))
+  right=$(( width - len - left ))
+  printf '%*s%s%*s' "$left" "" "$text" "$right" ""
+}
+
+gradient_row() {
+  local text="$1"
+  local width="$2"
+  local content colors i ch
+  content="$(center_text "$text" "$width")"
+  printf '  '
+  for ((i = 0; i < width; i++)); do
+    ch="${content:i:1}"
+    colors="$(gradient_rgb "$i" "$((width - 1))")"
+    printf '\033[48;2;%sm%b%b%s%b' "$colors" "$DARK" "$BOLD" "$ch" "$RESET"
+  done
+  printf '\n'
+}
+
+gradient_badge() {
+  local text="$1"
+  local width="$2"
+  if [ "$TRUECOLOR" != "true" ]; then
+    printf '  %s\n' "$(center_text "$text" "$width")"
+    return 0
+  fi
+  gradient_row "$text" "$width"
+}
+
 banner() {
-  printf '\n%bROSbot 2.0%b  %bROS 2 Jazzy control%b\n' "$BOLD$CYAN" "$RESET" "$MUTED" "$RESET"
-  printf '%bASUS Tinker Board | Ubuntu 24.04 | Nav2 + SLAM Toolbox%b\n\n' "$MUTED" "$RESET"
+  printf '\n'
+  gradient_badge "ROSBOT 2.0" 30
+  printf '  %bROS 2 Jazzy control for ROSbot 2.0%b\n\n' "$MUTED" "$RESET"
 }
 
 section() {
