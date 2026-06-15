@@ -48,6 +48,7 @@ camera="${ROSBOT_START_CAMERA:-false}"
 lidar="${ROSBOT_START_LIDAR:-true}"
 joy="${ROSBOT_START_JOY:-false}"
 verbose="${ROSBOT_VERBOSE:-false}"
+startup_wait="${ROSBOT_STARTUP_WAIT:-20}"
 monitor_interval="${ROSBOT_MONITOR_INTERVAL:-2}"
 twist_bridge="${ROSBOT_TWIST_BRIDGE:-true}"
 lidar_port="${ROSBOT_LIDAR_PORT:-/dev/rplidar}"
@@ -185,6 +186,7 @@ usage() {
   printf '  %-24s %s\n' "--lidar / --no-lidar" "Enable lidar where supported"
   printf '  %-24s %s\n' "--joy / --no-joy" "Enable or disable joystick teleop"
   printf '  %-24s %s\n' "--verbose" "Run in foreground and stream launch output"
+  printf '  %-24s %s\n' "--startup-wait SEC" "Seconds to watch launch startup before success"
   printf '  %-24s %s\n' "--dry-run" "Print the command without running it"
   printf '  %-24s %s\n' "--battery-safety" "Enable low-battery auto-stop"
   printf '  %-24s %s\n' "--no-battery-safety" "Disable low-battery auto-stop"
@@ -1024,6 +1026,48 @@ next_actions() {
   printf '  %-18s %s\n' "./rosbot stop" "stop all ROSbot processes"
 }
 
+launch_startup_failed() {
+  local log="$1"
+  [ -f "$log" ] || return 1
+  grep -Eq 'No response\.|process has died .*configure_robot|was required: shutting down launched system|\[ERROR\].*(pre_communication|configure_robot)' "$log"
+}
+
+launch_startup_failure_reason() {
+  local log="$1"
+  if grep -q 'No response\.' "$log"; then
+    printf 'MCU did not answer on serial; check robot power or flash the bundled ROSbot firmware'
+  elif grep -q 'Unsupported firmware' "$log"; then
+    printf 'MCU firmware is not compatible with this image; flash the bundled ROSbot firmware'
+  elif grep -q 'BACKEND configuration failed' "$log"; then
+    printf 'MCU firmware does not support backend selection; flash the bundled ROSbot firmware'
+  else
+    printf 'fatal launch error'
+  fi
+}
+
+fail_launch_startup() {
+  local launch_mode="$1"
+  local pid="$2"
+  local pid_file="$3"
+  local log="$4"
+  local waited="$5"
+  local reason="$6"
+
+  rm -f "$pid_file"
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    stop_robot_processes
+  else
+    stop_twist_bridge
+    stop_battery_monitor
+    start_lidar_motor_hold
+  fi
+  banner
+  error "ROSbot ${launch_mode} failed during startup after ${waited}s: ${reason}."
+  section "Last Log Lines"
+  tail -n 80 "$log" >&2 || true
+  return 1
+}
+
 run_launch_cmd() {
   local launch_mode="$1"
   shift
@@ -1049,6 +1093,10 @@ run_launch_cmd() {
     quote_cmd "$@"
     return 0
   fi
+  if ! [[ "$startup_wait" =~ ^[0-9]+$ ]]; then
+    error "--startup-wait must be a whole number of seconds."
+    return 2
+  fi
 
   mkdir -p "$LOG_DIR"
   local safe_command safe_namespace stamp log pid_file pid
@@ -1061,7 +1109,21 @@ run_launch_cmd() {
   nohup "$@" >"$log" 2>&1 < /dev/null &
   pid="$!"
   echo "$pid" > "$pid_file"
-  sleep 1
+
+  local waited
+  waited=0
+  while [ "$waited" -lt "$startup_wait" ]; do
+    sleep 1
+    waited=$((waited + 1))
+    if launch_startup_failed "$log"; then
+      fail_launch_startup "$launch_mode" "$pid" "$pid_file" "$log" "$waited" "$(launch_startup_failure_reason "$log")"
+      return 1
+    fi
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      fail_launch_startup "$launch_mode" "$pid" "$pid_file" "$log" "$waited" "launch process exited"
+      return 1
+    fi
+  done
 
   banner
   if kill -0 "$pid" >/dev/null 2>&1; then
@@ -1082,9 +1144,11 @@ run_launch_cmd() {
     return 0
   fi
 
-  error "ROSbot ${command} failed to start."
+  rm -f "$pid_file"
+  start_lidar_motor_hold
+  error "ROSbot ${launch_mode} failed to start."
   section "Last Log Lines"
-  tail -n 40 "$log" >&2 || true
+  tail -n 80 "$log" >&2 || true
   return 1
 }
 
@@ -1273,13 +1337,14 @@ status_view() {
     printf '%s\n' "$processes" | awk '
       {
         role="node"
-        if ($0 ~ /ros2 launch rosbot_bringup/) role="launch"
-        else if ($0 ~ /rplidar/) role="lidar"
+        if ($0 ~ /rosbot_battery_monitor/) role="battery"
+        else if ($0 ~ /rosbot_twist_bridge/) role="twist"
+        else if ($0 ~ /ros2 launch rosbot_bringup/) role="launch"
+        else if ($0 ~ /rplidar|rosbot_lidar_motor_hold/) role="lidar"
         else if ($0 ~ /openni2/) role="camera"
         else if ($0 ~ /ros2_control/) role="control"
         else if ($0 ~ /slam_toolbox/) role="slam"
         else if ($0 ~ /controller_server|planner_server|bt_navigator/) role="nav2"
-        else if ($0 ~ /rosbot_battery_monitor/) role="battery"
         printf "  %-7s %-18s %s\n", $1, $2, role
       }'
   fi
@@ -1442,6 +1507,10 @@ while [ "$#" -gt 0 ]; do
     --verbose)
       verbose=true
       shift
+      ;;
+    --startup-wait)
+      startup_wait="${2:-}"
+      shift 2
       ;;
     --dry-run)
       dry_run=true

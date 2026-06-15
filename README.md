@@ -222,6 +222,24 @@ You can override the config path with:
 ROSBOT_ENV_FILE=/path/to/rosbot.env ./rosbot status
 ```
 
+## MCU Firmware
+
+Some ROSbot 2.0 units still have older MCU firmware. If `./rosbot start` fails with `MCU did not answer on serial`, `Unsupported firmware`, or `BACKEND configuration failed`, flash the bundled Jazzy firmware once:
+
+```bash
+source ~/ros2_setup.sh
+ros2 run rosbot_utils flash_firmware --robot-model rosbot
+```
+
+Then verify the MCU handshake:
+
+```bash
+ros2 run rosbot_utils configure_robot --robot-model rosbot --backend mavlink
+```
+
+> [!CAUTION]
+> Flash only ROSbot 2.0 hardware that uses the ASUS Tinker Board UART connection. Keep the robot powered during flashing and do not run this on ROSbot XL, ROSbot 3, or custom controller hardware.
+
 ## Repository Layout
 
 ```text
@@ -333,6 +351,7 @@ ROSBOT_START_JOY=false
 ROS_DOMAIN_ID=0
 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ROSBOT_LIDAR_PORT=/dev/rplidar
+ROSBOT_STARTUP_WAIT=20
 ```
 
 For multi-robot use:
